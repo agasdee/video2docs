@@ -56,13 +56,20 @@ app.secret_key = os.environ.get("SECRET_KEY", "video2docs-secret-key")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 HISTORY_FILE = os.path.join(OUTPUT_DIR, "conversions.json")
 
-# Trigger background pre-download of all configured models (non-blocking)
+# Trigger background pre-download of LOCAL HuggingFace models only (non-blocking)
+# API-based models (Gemini, OpenAI) don't need downloading.
+
+# Model IDs that are API-based and should NOT be pre-downloaded
+_API_MODEL_PREFIXES = ("gemini", "openai/", "gpt-")
 
 def _prefetch_models():
     def worker():
         for entry in LLM_MODELS:
             mid = entry.get("id") if isinstance(entry, dict) else str(entry)
             if not mid:
+                continue
+            # Skip API-based models — they don't need local files
+            if any(mid.lower().startswith(prefix) for prefix in _API_MODEL_PREFIXES):
                 continue
             try:
                 # This will skip re-download if present in local HF cache
@@ -73,7 +80,9 @@ def _prefetch_models():
     t = threading.Thread(target=worker, name="llm-model-prefetch", daemon=True)
     t.start()
 
-if str(os.environ.get("PREFETCH_LLM_MODELS", "1")).lower() in ("1", "true", "yes", "on"):
+# Disabled by default to save bandwidth/storage.
+# Set PREFETCH_LLM_MODELS=1 in .env to enable pre-downloading local models.
+if str(os.environ.get("PREFETCH_LLM_MODELS", "0")).lower() in ("1", "true", "yes", "on"):
     _prefetch_models()
 
 

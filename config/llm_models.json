@@ -1,8 +1,9 @@
 {
-  "default": "google/flan-t5-large",
+  "default": "gemini-2.5-flash",
   "models": [
+    {"id": "gemini-2.5-flash", "label": "Google Gemini (via API)"},
+    {"id": "openai/gpt-4o-mini", "label": "OpenAI ChatGPT (via API)"},
     {"id": "google/flan-t5-large", "label": "google/flan-t5-large"},
-    {"id": "openai/gpt-oss-20b", "label": "openai/gpt-oss-20b"},
     {"id": "TinyLlama/TinyLlama-1.1B-Chat-v1.0", "label": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"},
     {"id": "microsoft/Phi-3.5-mini-instruct", "label": "microsoft/Phi-3.5-mini-instruct"},
     {"id": "HuggingFaceTB/SmolLM-135M", "label": "HuggingFaceTB/SmolLM-135M"},

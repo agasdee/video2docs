@@ -1,6 +1,5 @@
 # Video processing
-pytube>=12.1.0  # For YouTube video downloading
-pytubefix>=9.3.0
+yt-dlp>=2023.12.30  # For YouTube video downloading
 opencv-python>=4.7.0  # For video frame processing
 moviepy>=2.0.0  # For video manipulation
 

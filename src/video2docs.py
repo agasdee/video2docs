@@ -16,17 +16,20 @@ from typing import List, Dict, Tuple, Optional, Union
 import logging
 import re
 import time
+import subprocess
+import shutil
 from dotenv import load_dotenv
 
 # Video processing
+# Video processing
 import cv2
-from pytubefix import YouTube
-from pytubefix.cli import on_progress
-from moviepy import VideoFileClip
+import yt_dlp
+import glob
 
 # Audio processing
 import speech_recognition as sr
 from pydub import AudioSegment
+import concurrent.futures
 
 # Image processing
 from PIL import Image
@@ -42,13 +45,22 @@ from odf.style import Style, TextProperties
 from odf.draw import Frame, Image as ODFImage
 from fpdf import FPDF
 
+# Fix for PyTorch DLL loading on Windows Python 3.8+
+import sys
+if os.name == 'nt' and sys.version_info >= (3, 8):
+    try:
+        torch_lib = os.path.join(os.path.dirname(sys.executable), r'..\Lib\site-packages\torch\lib')
+        if os.path.exists(torch_lib):
+            os.add_dll_directory(torch_lib)
+    except Exception:
+        pass
+
 # LLM and AI
-import torch
-from transformers import pipeline, AutoModelForSeq2SeqLM, AutoModelForCausalLM, AutoTokenizer
+# Imports moved to LLMProcessor.__init__ to prevent DLL crash on startup
 from langchain_community.llms import OpenAI
 from langchain_community.llms.huggingface_pipeline import HuggingFacePipeline
-from langchain.prompts import PromptTemplate
-from langchain.schema.runnable import RunnablePassthrough
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
 
 # Configure logging
 logging.basicConfig(
@@ -73,8 +85,46 @@ class VideoProcessor:
         self.temp_dir = temp_dir or tempfile.mkdtemp()
         logger.info(f"Using temporary directory: {self.temp_dir}")
 
+    def _merge_with_ffmpeg(self, video_path: str, audio_path: str, output_path: str) -> bool:
+        """Merge separate video and audio files using ffmpeg.
+
+        Args:
+            video_path: Path to the video-only file
+            audio_path: Path to the audio-only file
+            output_path: Path for the merged output file
+
+        Returns:
+            True if merge was successful, False otherwise
+        """
+        try:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-i", audio_path,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-strict", "experimental",
+                output_path
+            ]
+            logger.info(f"Merging video+audio with ffmpeg: {' '.join(cmd)}")
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300
+            )
+            if result.returncode == 0:
+                logger.info(f"ffmpeg merge successful: {output_path}")
+                return True
+            else:
+                logger.warning(f"ffmpeg merge failed (rc={result.returncode}): {result.stderr[:500]}")
+                return False
+        except FileNotFoundError:
+            logger.warning("ffmpeg not found on system PATH")
+            return False
+        except Exception as e:
+            logger.warning(f"ffmpeg merge error: {e}")
+            return False
+
     def download_youtube_video(self, url: str, max_retries: int = 3) -> str:
-        """Download a YouTube video.
+        """Download a YouTube video at the highest possible resolution using yt-dlp.
 
         Args:
             url: YouTube video URL
@@ -83,78 +133,37 @@ class VideoProcessor:
         Returns:
             Path to the downloaded video file
         """
-        logger.info(f"Downloading YouTube video: {url}")
-
-        # List of common YouTube domains to try if the original URL fails
-        youtube_domains = [
-            "www.youtube.com",
-            "youtube.com",
-            "youtu.be",
-            "m.youtube.com",
-        ]
-
-        # Extract video ID from URL
-        video_id = None
-        if "youtube.com/watch" in url:
-            # Format: https://www.youtube.com/watch?v=VIDEO_ID
-            query_params = url.split("?")[1].split("&")
-            for param in query_params:
-                if param.startswith("v="):
-                    video_id = param[2:]
-                    break
-        elif "youtu.be/" in url:
-            # Format: https://youtu.be/VIDEO_ID
-            video_id = url.split("youtu.be/")[1].split("?")[0]
-
-        if not video_id:
-            error_msg = f"Could not extract video ID from URL: {url}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-
-        # Try downloading with the original URL first
-        urls_to_try = [url]
-
-        # Add alternative URLs with different domains
-        for domain in youtube_domains:
-            if domain not in url:
-                alt_url = f"https://{domain}/watch?v={video_id}"
-                if alt_url != url:
-                    urls_to_try.append(alt_url)
-
-        last_exception = None
-        for retry_count in range(max_retries):
-            for try_url in urls_to_try:
-                try:
-                    logger.info(f"Attempt {retry_count + 1}/{max_retries} with URL: {try_url}")
-                    yt = YouTube(try_url, on_progress_callback=on_progress)
-                    logger.info(yt.title)
-                    video = yt.streams.get_highest_resolution()
-
-                    if not video:
-                        logger.warning(f"No suitable video streams found for {try_url}")
-                        continue
-
-                    output_path = video.download(output_path=self.temp_dir)
-                    logger.info(f"Downloaded video to: {output_path}")
-                    return output_path
-                except Exception as e:
-                    logger.warning(f"Error downloading YouTube video from {try_url}: {e}")
-                    last_exception = e
-                    # Continue to the next URL or retry
-
-            # Wait before retrying
-            if retry_count < max_retries - 1:
-                wait_time = 2 ** retry_count  # Exponential backoff
-                logger.info(f"Waiting {wait_time} seconds before next retry...")
-                time.sleep(wait_time)
-
-        # If we get here, all attempts failed
-        error_msg = f"Failed to download YouTube video after {max_retries} attempts with multiple URLs. Last error: {last_exception}"
-        logger.error(error_msg)
-        raise Exception(error_msg)
+        logger.info(f"Downloading YouTube video using yt-dlp: {url}")
+        
+        ydl_opts = {
+            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'outtmpl': os.path.join(self.temp_dir, 'video_%(id)s.%(ext)s'),
+            'merge_output_format': 'mp4',
+            'retries': max_retries,
+            'quiet': False
+        }
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                base, _ = os.path.splitext(filename)
+                mp4_filename = base + ".mp4"
+                
+                if os.path.exists(mp4_filename):
+                    logger.info(f"Downloaded video to: {mp4_filename}")
+                    return mp4_filename
+                elif os.path.exists(filename):
+                    logger.info(f"Downloaded video to: {filename}")
+                    return filename
+                else:
+                    raise FileNotFoundError("Could not locate the downloaded video file.")
+        except Exception as e:
+            logger.error(f"Error downloading YouTube video from {url}: {e}")
+            raise
 
     def extract_audio(self, video_path: str) -> str:
-        """Extract audio from video file.
+        """Extract audio from video file using FFmpeg.
 
         Args:
             video_path: Path to the video file
@@ -162,89 +171,80 @@ class VideoProcessor:
         Returns:
             Path to the extracted audio file
         """
-        logger.info(f"Extracting audio from: {video_path}")
+        logger.info(f"Extracting audio using FFmpeg from: {video_path}")
+        audio_path = os.path.join(self.temp_dir, "audio.wav")
+
         try:
-            video = VideoFileClip(video_path)
-            audio_path = os.path.join(self.temp_dir, "audio.wav")
-            video.audio.write_audiofile(audio_path, codec='pcm_s16le')
+            cmd = [
+                "ffmpeg", "-i", video_path, 
+                "-vn", "-acodec", "pcm_s16le", 
+                "-ar", "44100", "-ac", "2", 
+                audio_path, "-y"
+            ]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
             logger.info(f"Extracted audio to: {audio_path}")
             return audio_path
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg error extracting audio: {e.stderr.decode('utf-8', errors='ignore')}")
+            raise
         except Exception as e:
             logger.error(f"Error extracting audio: {e}")
             raise
 
-    def extract_frames(self, video_path: str, interval: float = 1.0) -> List[Tuple[float, str]]:
-        """Extract frames from video at specified intervals.
+    def extract_frames(self, video_path: str, interval: float = 1.0, threshold: float = 0.8) -> List[Tuple[float, str]]:
+        """Extract unique frames using FFmpeg scene detection.
 
         Args:
             video_path: Path to the video file
-            interval: Interval between frames in seconds
+            interval: Ignored (kept for compatibility)
+            threshold: Similarity threshold (0.0 to 1.0). Frames more similar than this are skipped.
 
         Returns:
             List of tuples containing (timestamp, frame_path)
         """
-        logger.info(f"Extracting frames from: {video_path}")
+        logger.info(f"Extracting unique frames using FFmpeg scene detection from: {video_path}")
         frames = []
         try:
-            video = cv2.VideoCapture(video_path)
-            fps = video.get(cv2.CAP_PROP_FPS)
-            frame_interval = int(fps * interval)
-
-            success, frame = video.read()
-            count = 0
-            frame_count = 0
-
-            while success:
-                if count % frame_interval == 0:
-                    timestamp = count / fps
-                    frame_path = os.path.join(self.temp_dir, f"frame_{frame_count:04d}.jpg")
-                    cv2.imwrite(frame_path, frame)
-                    frames.append((timestamp, frame_path))
-                    frame_count += 1
-
-                success, frame = video.read()
-                count += 1
-
-            video.release()
-            logger.info(f"Extracted {len(frames)} frames")
+            scene_val = max(0.01, (1.0 - threshold) * 0.5)
+            output_pattern = os.path.join(self.temp_dir, "frame_%04d.jpg")
+            
+            cmd = [
+                "ffmpeg", "-i", video_path,
+                "-vf", f"select='gt(scene,{scene_val})',showinfo",
+                "-fps_mode", "vfr",
+                output_pattern, "-y"
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='ignore', check=True)
+            
+            import re
+            timestamps = []
+            for line in result.stderr.split('\n'):
+                if "Parsed_showinfo" in line and "pts_time:" in line:
+                    match = re.search(r'pts_time:\s*([\d\.]+)', line)
+                    if match:
+                        timestamps.append(float(match.group(1)))
+            
+            extracted_files = sorted(glob.glob(os.path.join(self.temp_dir, "frame_*.jpg")))
+            
+            for i, frame_path in enumerate(extracted_files):
+                ts = timestamps[i] if i < len(timestamps) else float(i)
+                frames.append((ts, frame_path))
+                
+            logger.info(f"Extracted {len(frames)} unique slide frames via FFmpeg")
             return frames
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg error extracting frames: {e.stderr}")
+            raise
         except Exception as e:
             logger.error(f"Error extracting frames: {e}")
             raise
 
     def detect_slides(self, frames: List[Tuple[float, str]], threshold: float = 0.8) -> List[Tuple[float, str]]:
-        """Detect slides/images in the extracted frames.
-
-        Args:
-            frames: List of (timestamp, frame_path) tuples
-            threshold: Similarity threshold for slide detection
-
-        Returns:
-            List of (timestamp, frame_path) tuples for detected slides
+        """Legacy method - unique slide detection is now done efficiently during extract_frames.
+        Returns the frames as-is to maintain compatibility with existing job flow.
         """
-        logger.info("Detecting slides in frames")
-        if not frames:
-            return []
-
-        slides = [frames[0]]  # First frame is always a slide
-
-        for i in range(1, len(frames)):
-            prev_img = cv2.imread(slides[-1][1], cv2.IMREAD_GRAYSCALE)
-            curr_img = cv2.imread(frames[i][1], cv2.IMREAD_GRAYSCALE)
-
-            # Resize images to same dimensions if needed
-            if prev_img.shape != curr_img.shape:
-                curr_img = cv2.resize(curr_img, (prev_img.shape[1], prev_img.shape[0]))
-
-            # Calculate similarity
-            similarity = ssim(prev_img, curr_img)
-
-            if similarity < threshold:
-                slides.append(frames[i])
-                logger.debug(f"Detected new slide at {frames[i][0]:.2f}s (similarity: {similarity:.2f})")
-
-        logger.info(f"Detected {len(slides)} slides")
-        return slides
+        logger.info(f"Slides are already filtered during extraction. Returning {len(frames)} slides.")
+        return frames
 
 
 class AudioProcessor:
@@ -256,65 +256,77 @@ class AudioProcessor:
         Args:
             use_gpu: Whether to use GPU for processing
         """
-        self.use_gpu = use_gpu and torch.cuda.is_available()
+        try:
+            import torch
+            self.use_gpu = use_gpu and torch.cuda.is_available()
+        except Exception:
+            self.use_gpu = False
         self.recognizer = sr.Recognizer()
         logger.info(f"Initialized audio processor (GPU: {self.use_gpu})")
 
+    def _transcribe_single_chunk(self, chunk, start_time, end_time, audio_path, language):
+        chunk_path = f"{audio_path}_chunk_{start_time}_{end_time}.wav"
+        text = ""
+        try:
+            chunk.export(chunk_path, format="wav")
+            with sr.AudioFile(chunk_path) as source:
+                audio_data = self.recognizer.record(source)
+                logger.info(f"Transcribing chunk from {start_time} to {end_time} ms")
+                try:
+                    text = self.recognizer.recognize_google(audio_data, language=language)
+                    logger.info(f"Transcribed chunk: {text}")
+                except sr.UnknownValueError:
+                    pass
+                except sr.RequestError as re_err:
+                    logger.error(f"Speech recognition error {start_time}-{end_time}: {re_err}")
+        except Exception as e:
+            logger.error(f"Error processing chunk {start_time}-{end_time}: {e}")
+        finally:
+            if os.path.exists(chunk_path):
+                try:
+                    os.remove(chunk_path)
+                except:
+                    pass
+                    
+        return {
+            "text": text,
+            "start_time": start_time / 1000.0,
+            "end_time": end_time / 1000.0
+        }
+
     def transcribe_audio(self, audio_path: str, chunk_size: int = 60000, language: str = "en-US") -> List[Dict[str, Union[str, float, float]]]:
-        """Transcribe audio file to text.
+        """Transcribe audio file to text in parallel.
 
         Args:
             audio_path: Path to the audio file
             chunk_size: Size of audio chunks in milliseconds
+            language: Language code
 
         Returns:
             List of dictionaries with text, start_time, and end_time
         """
-        logger.info(f"Transcribing audio: {audio_path}")
+        logger.info(f"Transcribing audio: {audio_path} in parallel")
         try:
             audio = AudioSegment.from_file(audio_path)
             duration = len(audio)
-            chunks = []
-
-            for start_time in range(0, duration, chunk_size):
-                end_time = min(start_time + chunk_size, duration)
-                chunk = audio[start_time:end_time]
-
-                # Save chunk to temporary file
-                chunk_path = f"{audio_path}_chunk_{start_time}_{end_time}.wav"
-                try:
-                    chunk.export(chunk_path, format="wav")
-
-                    # Transcribe chunk
-                    with sr.AudioFile(chunk_path) as source:
-                        audio_data = self.recognizer.record(source)
-                        logger.info(f"Transcribing chunk from {start_time} to {end_time} ms")
-                        try:
-                            text = self.recognizer.recognize_google(audio_data, language=language)
-                            logger.info(f"Transcribed chunk: {text}")
-                        except sr.UnknownValueError:
-                            logger.warning(f"Speech not understood for chunk {start_time}-{end_time} ms; leaving text empty.")
-                            text = ""
-                        except sr.RequestError as re_err:
-                            logger.error(f"Speech recognition service error for chunk {start_time}-{end_time} ms: {re_err}")
-                            text = ""
-
-                    chunks.append({
-                        "text": text,
-                        "start_time": start_time / 1000.0,  # Convert to seconds
-                        "end_time": end_time / 1000.0  # Convert to seconds
-                    })
-                finally:
-                    # Clean up temporary file
-                    if os.path.exists(chunk_path):
-                        try:
-                            os.remove(chunk_path)
-                        except Exception as cleanup_err:
-                            logger.warning(f"Failed to remove temp chunk file {chunk_path}: {cleanup_err}")
-
+            
+            futures = []
+            # We use max_workers=3 to avoid getting rate-limited by Google's Free Speech API
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                for start_time in range(0, duration, chunk_size):
+                    end_time = min(start_time + chunk_size, duration)
+                    chunk = audio[start_time:end_time]
+                    
+                    futures.append(
+                        executor.submit(self._transcribe_single_chunk, chunk, start_time, end_time, audio_path, language)
+                    )
+            
+            chunks = [f.result() for f in futures]
             logger.info(f"Transcribed {len(chunks)} audio chunks")
             return chunks
         except Exception as e:
+            logger.error(f"Error in transcription: {e}")
+            raise
             logger.error(f"Error transcribing audio: {e}")
             raise
 
@@ -331,12 +343,29 @@ class LLMProcessor:
             use_gpu: Whether to use GPU for processing
         """
         self.use_openai = use_openai
-        self.use_gpu = use_gpu and torch.cuda.is_available()
+        self.torch_loaded = False
+        try:
+            import torch
+            from transformers import pipeline, AutoModelForSeq2SeqLM, AutoModelForCausalLM, AutoTokenizer
+            self.use_gpu = use_gpu and torch.cuda.is_available()
+            self.torch_loaded = True
+        except Exception as e:
+            self.use_gpu = False
+            if not use_openai:
+                logger.warning(f"PyTorch failed to load: {e}")
 
         if use_openai and os.getenv("OPENAI_API_KEY"):
             logger.info("Using OpenAI for LLM processing")
             self.llm = OpenAI(temperature=0.1)
+        elif os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+            logger.info("Using Google Gemini for LLM processing")
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1, google_api_key=api_key)
         else:
+            if not self.torch_loaded:
+                raise RuntimeError("ระบบของคุณไม่สามารถใช้งาน Local AI Model ได้เนื่องจาก PyTorch แจ้ง Error! กรุณาใช้งาน Gemini หรือ OpenAI โดยเพิ่ม GEMINI_API_KEY หรือ OPENAI_API_KEY ลงในไฟล์ .env แทนครับ")
+            
             # Default to a HuggingFace model (allow override via .env)
             env_model = os.getenv("VIDEO2DOCS_LLM_MODEL", "").strip()
             self.model_name = (model_name or env_model or "google/flan-t5-large")
@@ -763,7 +792,12 @@ class Video2Docs:
         self.temp_dir = temp_dir or os.path.join(output_dir, "temp")
         os.makedirs(self.temp_dir, exist_ok=True)
 
-        self.use_gpu = use_gpu and torch.cuda.is_available()
+        try:
+            import torch
+            self.use_gpu = use_gpu and torch.cuda.is_available()
+        except Exception:
+            self.use_gpu = False
+
         if self.use_gpu:
             logger.info("GPU is available and will be used")
         else:
